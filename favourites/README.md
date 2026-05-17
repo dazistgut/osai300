@@ -159,18 +159,66 @@ PROBE=1 ./enum-ai.sh
 PROBE=1 PROBE_MODEL=llama3 ./enum-ai.sh
 ```
 
-Output layout:
+Output is a single text report — no folders, no per-endpoint files:
 
 ```
-results/20260517T194500Z-enum/
-├── _summary.txt                          # one-block verdict per target
-└── 10.10.10.42-11434-http/
-    ├── _fingerprint.txt                  # "Verdict: Ollama" + status table
-    ├── api-tags.body                     # raw JSON: {"models":[...]}
-    ├── api-tags.head
-    ├── v1-models.body                    # status 404 here (Ollama doesn't expose this)
-    └── ...
+results/20260517T194500Z-enum.txt
 ```
+
+Layout inside the report:
+
+```
+################################################################################
+# enum-ai.sh report
+# Run     : 20260517T194500Z
+# Targets : 3
+# PROBE   : 0
+################################################################################
+
+================================================================================
+[1/3] http://10.10.10.42:11434
+================================================================================
+Verdict : Ollama
+Models  : llama3:8b, mistral:7b, codellama:13b
+
+Endpoint status:
+  STATUS  SIZE      ENDPOINT
+  200     1234      /api/tags
+  404     18        /v1/models
+  ...
+
+Responses (excerpts, non-404 only):
+
+--- /api/tags  [200, 1234 bytes, application/json] ---
+{
+  "models": [ ... ]
+}
+
+--- /  [200, 11 bytes, text/plain] ---
+Ollama is running
+
+================================================================================
+[2/3] http://10.10.10.43:8000
+================================================================================
+...
+
+================================================================================
+Verdict index (quick scan)
+================================================================================
+[1/3] http://10.10.10.42:11434      Verdict : Ollama
+[2/3] http://10.10.10.43:8000       Verdict : FastAPI; OpenAI-compatible (/v1/models)
+[3/3] http://10.10.10.44:7860       Verdict : Gradio
+```
+
+The verdict index at the bottom is the headline — I can scan that without
+reading the body excerpts. Knobs for the report:
+
+| Var | Default | What it does |
+|-----|---------|--------------|
+| `MAX_BODY_LINES` | 30 | Trim each body excerpt to this many lines |
+| `MAX_BODY_CHARS` | 2000 | Hard char cap per excerpt |
+| `BODY_EXCERPTS` | 1 | Set `0` for status-table-only output |
+| `KEEP_RAW` | 0 | `1` keeps the full raw responses under `/tmp/enum-ai-raw-XXXXX/` for deep-dive |
 
 What the verdict line covers (heuristic, order = priority):
 
@@ -206,11 +254,14 @@ rg -l 'openapi|swagger|redoc|api-docs' results/<ts>/
 # CORS surface
 rg -i 'access-control-' results/<ts>/*/*-headers.txt
 
-# every verdict from an enum-ai run, sorted
-rg '^verdict:' results/<ts>-enum/_summary.txt | sort -u
+# enum-ai: scan verdicts only (skip the body excerpts)
+grep -E '^(\[[0-9]+/|Verdict|Models)' results/<ts>-enum.txt
 
-# every model name surfaced across all targets
-rg '^models:' results/<ts>-enum/_summary.txt
+# enum-ai: just the bottom index
+sed -n '/^Verdict index/,$p' results/<ts>-enum.txt
+
+# enum-ai: every model name found across all targets
+grep -E '^Models  :' results/<ts>-enum.txt
 ```
 
 ## Cross-references

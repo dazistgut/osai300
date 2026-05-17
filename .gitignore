@@ -34,6 +34,7 @@ Thumbs.db
 .vscode/
 .idea/
 CLAUDE.md
+.claude/
 
 # Captured artifacts (allow tracking explicitly if needed)
 *.har

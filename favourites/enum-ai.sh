@@ -3,9 +3,14 @@
 # enum-ai.sh — drill into the AI/LLM surface that http-triage.sh found.
 #
 # For each live HTTP(S) service I throw GETs (and optional POSTs) at the
-# high-value AI endpoints, capture raw responses + headers, then pattern-
-# match to fingerprint the framework (OpenAI-compatible / Ollama / FastAPI
-# / Anthropic / Gradio / Streamlit / KServe / TF Serving / Triton …).
+# high-value AI endpoints, then pattern-match to fingerprint the framework
+# (OpenAI-compatible / Ollama / FastAPI / Anthropic / Gradio / Streamlit /
+# KServe / TF Serving / Triton …).
+#
+# Output: ONE consolidated text report at ./results/<UTC-ts>-enum.txt
+# (the raw responses are captured in /tmp during the run and cleaned up).
+# Per target the report shows: verdict, models, endpoint status table,
+# and a short body excerpt for each non-404 response.
 #
 # Usage:
 #   ./enum-ai.sh                         # auto: most recent ./results/<ts>/ from http-triage
@@ -14,18 +19,16 @@
 #   ./enum-ai.sh https://api.lab.local
 #   ./enum-ai.sh urllist.txt             # file of base URLs, one per line
 #
-# Output: ./results/<UTC-ts>-enum/<host>-<port>-<scheme>/
-#   _fingerprint.txt   — heuristic verdict for this service
-#   <endpoint>.body    — raw response body
-#   <endpoint>.head    — response headers + status
-#   _summary.txt at top level — one-line verdict per target across the run
-#
-# Active POST probes are opt-in: PROBE=1 ./enum-ai.sh
-# By default this is a GET-only enumeration — POSTs add side-effects (cost,
-# logs, possibly a generated completion) and I want to make that explicit.
+# Knobs (env):
+#   PROBE=1            send POST probes to chat/completions endpoints (off by default)
+#   PROBE_MODEL        model name for POST probes (default gpt-3.5-turbo)
+#   CURL_TIMEOUT       seconds per request (default 8)
+#   MAX_BODY_LINES     truncate body excerpts to this many lines (default 30)
+#   MAX_BODY_CHARS     hard char cap for body excerpts (default 2000)
+#   BODY_EXCERPTS=0    skip the body excerpts entirely (status table only)
+#   KEEP_RAW=1         also keep raw responses in /tmp/enum-ai-raw-<ts>/
 #
 # Scope: authorized testing / exam prep only.
-#
 # Paths are CWD-relative (matches http-triage.sh).
 
 set -uo pipefail
@@ -34,14 +37,16 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CURL_TIMEOUT="${CURL_TIMEOUT:-8}"
-PROBE="${PROBE:-0}"               # 1 = send POST probes to /v1/chat/completions etc.
-PROBE_MODEL="${PROBE_MODEL:-gpt-3.5-turbo}"  # arbitrary; servers tend to echo back which models they accept
+PROBE="${PROBE:-0}"
+PROBE_MODEL="${PROBE_MODEL:-gpt-3.5-turbo}"
+MAX_BODY_LINES="${MAX_BODY_LINES:-30}"
+MAX_BODY_CHARS="${MAX_BODY_CHARS:-2000}"
+BODY_EXCERPTS="${BODY_EXCERPTS:-1}"
+KEEP_RAW="${KEEP_RAW:-0}"
 
-# Endpoints I always GET. One per line: <label>|<path>
-# label becomes the filename, path is the URL suffix.
+# GETs I always do. <label>|<path>
 GET_ENDPOINTS=$(cat <<'EOF'
 v1-models|/v1/models
-v1-models-noslash|/v1/models/
 openai-models|/models
 api-tags|/api/tags
 api-version|/api/version
@@ -80,15 +85,10 @@ usage() {
 }
 
 require() {
-    command -v "$1" >/dev/null 2>&1 || {
-        echo "[!] missing required tool: $1" >&2
-        exit 1
-    }
+    command -v "$1" >/dev/null 2>&1 || { echo "[!] missing: $1" >&2; exit 1; }
 }
-
 require curl
-# jq is optional — used to pretty-print and to extract model names. Degrade
-# gracefully if it's not on the box.
+
 HAVE_JQ=0
 command -v jq >/dev/null 2>&1 && HAVE_JQ=1
 
@@ -98,12 +98,10 @@ declare -a BASE_URLS
 
 add_url() {
     local url="$1"
-    url="${url%/}"   # strip trailing /
+    url="${url%/}"
     BASE_URLS+=("$url")
 }
 
-# Walk a results/<ts>/ dir from http-triage.sh and pull (host, scheme, port)
-# tuples out of the headers filenames.
 ingest_triage_dir() {
     local dir="$1"
     [[ -d "$dir" ]] || return 1
@@ -113,7 +111,6 @@ ingest_triage_dir() {
         host="$(basename "$host_dir")"
         for hdr_file in "$host_dir"*-headers.txt; do
             [[ -f "$hdr_file" ]] || continue
-            # filename shape: <scheme>-<port>-headers.txt
             local base
             base="$(basename "$hdr_file" -headers.txt)"
             scheme="${base%%-*}"
@@ -124,8 +121,6 @@ ingest_triage_dir() {
 }
 
 find_latest_results() {
-    # Most recent ./results/<UTC-ts>/ that has the http-triage shape
-    # (i.e. contains an nmap-summary.txt). Excludes my own -enum runs.
     local dir
     dir="$(ls -1dt ./results/*/ 2>/dev/null | while read -r d; do
         [[ -f "${d}nmap-summary.txt" ]] && echo "$d" && break
@@ -164,42 +159,30 @@ else
     fi
 fi
 
-if [[ "${#BASE_URLS[@]}" -eq 0 ]]; then
-    echo "[!] no base URLs to enumerate" >&2
-    exit 1
-fi
+[[ "${#BASE_URLS[@]}" -gt 0 ]] || { echo "[!] no base URLs to enumerate" >&2; exit 1; }
 
 echo "[+] targets: ${#BASE_URLS[@]}"
-[[ "$PROBE" == "1" ]] && echo "[+] PROBE=1 — will send POSTs to chat/completions endpoints" || \
-    echo "[i] GET-only (set PROBE=1 to enable POST probes)"
+[[ "$PROBE" == "1" ]] && echo "[+] PROBE=1 — POSTs enabled" \
+                     || echo "[i] GET-only (set PROBE=1 to enable POST probes)"
 echo
 
-# ---- output dir -------------------------------------------------------------
+# ---- output paths -----------------------------------------------------------
 
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
-OUT_DIR="./results/${TS}-enum"
-mkdir -p "$OUT_DIR"
-SUMMARY="${OUT_DIR}/_summary.txt"
-: > "$SUMMARY"
+REPORT="./results/${TS}-enum.txt"
+mkdir -p "./results"
 
-# ---- per-target enumeration -------------------------------------------------
-
-slug_for_url() {
-    # http://10.10.10.42:8000 -> 10.10.10.42-8000-http
-    local url="$1" scheme host port
-    scheme="${url%%://*}"
-    local rest="${url#*://}"
-    host="${rest%%:*}"
-    port="${rest##*:}"
-    [[ "$port" == "$rest" ]] && {
-        # no explicit port
-        case "$scheme" in
-            https) port=443 ;;
-            *)     port=80  ;;
-        esac
-    }
-    echo "${host}-${port}-${scheme}"
+RAW_DIR="$(mktemp -d -t enum-ai-raw-XXXXXX)"
+cleanup() {
+    if [[ "$KEEP_RAW" == "1" ]]; then
+        echo "[+] raw responses kept: $RAW_DIR"
+    else
+        rm -rf "$RAW_DIR"
+    fi
 }
+trap cleanup EXIT
+
+# ---- fetching ---------------------------------------------------------------
 
 fetch_get() {
     local url="$1" body_file="$2" head_file="$3"
@@ -211,59 +194,74 @@ fetch_get() {
         -o "$body_file" \
         -D >(cat >> "$head_file") \
         -w "STATUS=%{http_code} SIZE=%{size_download} CT=%{content_type}\n" \
-        "$url" 2>/dev/null >> "$head_file" || echo "STATUS=000" >> "$head_file"
+        "$url" 2>/dev/null >> "$head_file" || echo "STATUS=000 SIZE=0 CT=" >> "$head_file"
 }
 
 fetch_post() {
-    local url="$1" body_file="$2" head_file="$3" data="$4" ctype="${5:-application/json}"
+    local url="$1" body_file="$2" head_file="$3" data="$4"
     {
         echo "# $(date -u +%Y-%m-%dT%H:%M:%SZ)"
         echo "# POST $url"
         echo "# data: $data"
     } > "$head_file"
     curl -ks --max-time "$CURL_TIMEOUT" \
-        -X POST \
-        -H "Content-Type: $ctype" \
-        -d "$data" \
+        -X POST -H "Content-Type: application/json" -d "$data" \
         -o "$body_file" \
         -D >(cat >> "$head_file") \
         -w "STATUS=%{http_code} SIZE=%{size_download} CT=%{content_type}\n" \
-        "$url" 2>/dev/null >> "$head_file" || echo "STATUS=000" >> "$head_file"
+        "$url" 2>/dev/null >> "$head_file" || echo "STATUS=000 SIZE=0 CT=" >> "$head_file"
 }
 
-status_of() {
-    grep -oE 'STATUS=[0-9]+' "$1" | tail -1 | cut -d= -f2
+meta_of() {
+    # echo "STATUS SIZE CT" parsed out of the head file
+    awk '
+        /^STATUS=/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^STATUS=/) status = substr($i, 8)
+                if ($i ~ /^SIZE=/)   size   = substr($i, 6)
+                if ($i ~ /^CT=/)     ct     = substr($i, 4)
+            }
+        }
+        END { print (status ? status : "000"), (size ? size : 0), (ct ? ct : "-") }
+    ' "$1"
 }
+
+slug_for_url() {
+    local url="$1" scheme rest host port
+    scheme="${url%%://*}"
+    rest="${url#*://}"
+    rest="${rest%%/*}"
+    if [[ "$rest" == *:* ]]; then host="${rest%:*}"; port="${rest##*:}"
+    else host="$rest"; case "$scheme" in https) port=443;; *) port=80;; esac
+    fi
+    echo "${host}-${port}-${scheme}"
+}
+
+# ---- fingerprinting (works off RAW_DIR/<slug>/ for one target) -------------
 
 fingerprint() {
-    # Heuristic verdict for one target dir. Order matters — more specific first.
     local d="$1"
     local verdicts=()
 
-    # Ollama: /api/tags returns {"models":[{"name":...,"modified_at":...}]}
     if [[ -s "${d}/api-tags.body" ]] && grep -q '"models"' "${d}/api-tags.body" \
         && grep -q '"modified_at"' "${d}/api-tags.body" 2>/dev/null; then
         verdicts+=("Ollama")
     fi
 
-    # OpenAI-compatible: /v1/models with object:list + data[].owned_by
     if [[ -s "${d}/v1-models.body" ]] && grep -q '"object":"list"' "${d}/v1-models.body" \
         && grep -q '"data"' "${d}/v1-models.body"; then
         verdicts+=("OpenAI-compatible (/v1/models)")
     fi
 
-    # Anthropic-style: /v1/messages typically 401/400 without auth header,
-    # or accepts model+messages with anthropic-version header
     if [[ -s "${d}/v1-messages.head" ]]; then
         local st_msg
-        st_msg="$(status_of "${d}/v1-messages.head")"
-        if [[ "$st_msg" == "401" || "$st_msg" == "400" || "$st_msg" == "405" ]] \
+        st_msg="$(meta_of "${d}/v1-messages.head" | awk '{print $1}')"
+        if [[ "$st_msg" =~ ^(400|401|405)$ ]] \
             && grep -qi 'anthropic\|x-api-key' "${d}/v1-messages.head" "${d}/v1-messages.body" 2>/dev/null; then
             verdicts+=("Anthropic-compatible (/v1/messages)")
         fi
     fi
 
-    # FastAPI: /openapi.json valid + "FastAPI" string OR Server: uvicorn
     if [[ -s "${d}/openapi-json.body" ]] && grep -q '"openapi"' "${d}/openapi-json.body"; then
         if grep -q 'FastAPI' "${d}/openapi-json.body"; then
             verdicts+=("FastAPI")
@@ -275,31 +273,26 @@ fingerprint() {
         verdicts+=("Uvicorn (likely FastAPI)")
     fi
 
-    # Gradio: HTML mentions gradio-app
     if grep -qi 'gradio' "${d}/root.body" 2>/dev/null; then
         verdicts+=("Gradio")
     fi
 
-    # Streamlit: _stcore/health is the canonical health endpoint
     if [[ -s "${d}/stcore-health.head" ]]; then
         local st_stc
-        st_stc="$(status_of "${d}/stcore-health.head")"
+        st_stc="$(meta_of "${d}/stcore-health.head" | awk '{print $1}')"
         [[ "$st_stc" == "200" ]] && verdicts+=("Streamlit")
     fi
 
-    # KServe v2 / Triton: /v2/models
     if [[ -s "${d}/v2-models.body" ]] && grep -qE '"name"|"versions"' "${d}/v2-models.body"; then
         verdicts+=("KServe v2 / Triton (/v2/models)")
     fi
 
-    # TF Serving / KServe v1: /v1/predictions or /predictions
     if [[ -s "${d}/v1-predictions.head" ]] || [[ -s "${d}/predictions.head" ]]; then
         if grep -qi 'tensorflow\|tfserving' "${d}"/*.head "${d}"/*.body 2>/dev/null; then
             verdicts+=("TensorFlow Serving")
         fi
     fi
 
-    # Banner-based extras
     if grep -qi '^server: gunicorn' "${d}"/*.head 2>/dev/null; then
         verdicts+=("Gunicorn (Flask/Django/Starlette behind it)")
     fi
@@ -308,15 +301,13 @@ fingerprint() {
     fi
 
     if [[ "${#verdicts[@]}" -eq 0 ]]; then
-        echo "unknown — see raw responses"
+        echo "unknown — see endpoint responses below"
     else
-        # de-dup, keep order
         printf '%s\n' "${verdicts[@]}" | awk '!seen[$0]++' | paste -sd '; ' -
     fi
 }
 
 extract_models() {
-    # Pull model names out of /v1/models or /api/tags if jq is available.
     local d="$1"
     [[ "$HAVE_JQ" == "1" ]] || return 0
     if [[ -s "${d}/v1-models.body" ]]; then
@@ -327,14 +318,52 @@ extract_models() {
     fi
 }
 
+# ---- body excerpt helper ----------------------------------------------------
+
+is_text_ct() {
+    case "$1" in
+        */json*|*/yaml*|*/xml*|text/*|application/javascript*|application/x-yaml*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+body_excerpt() {
+    local body="$1" ct="$2"
+    [[ -s "$body" ]] || { echo "(empty body)"; return; }
+    is_text_ct "$ct" || { echo "(non-text body, $(wc -c < "$body") bytes — skipped)"; return; }
+
+    local tmp
+    tmp="$(mktemp)"
+    # Pretty-print JSON if jq is available and the content looks JSON-ish.
+    if [[ "$HAVE_JQ" == "1" ]] && [[ "$ct" == */json* ]] && jq -e . < "$body" >/dev/null 2>&1; then
+        jq . < "$body" > "$tmp"
+    else
+        cp "$body" "$tmp"
+    fi
+
+    # Truncate by lines then by chars.
+    local out
+    out="$(head -n "$MAX_BODY_LINES" "$tmp" | cut -c1-200)"
+    if [[ "$(wc -c <<< "$out")" -gt "$MAX_BODY_CHARS" ]]; then
+        out="$(echo "$out" | cut -c1-"$MAX_BODY_CHARS")"
+        out="${out}"$'\n[... truncated ...]'
+    elif [[ "$(wc -l < "$tmp")" -gt "$MAX_BODY_LINES" ]]; then
+        out="${out}"$'\n[... truncated, '"$(wc -l < "$tmp")"' lines total ...]'
+    fi
+    rm -f "$tmp"
+    echo "$out"
+}
+
+# ---- per-target enumeration -------------------------------------------------
+
 enum_one() {
-    local url="$1"
+    local url="$1" idx="$2" total="$3"
     local slug
     slug="$(slug_for_url "$url")"
-    local d="${OUT_DIR}/${slug}"
+    local d="${RAW_DIR}/${slug}"
     mkdir -p "$d"
 
-    echo "[*] $url -> $d"
+    echo "[*] [$idx/$total] $url"
 
     # GETs
     while IFS='|' read -r label path; do
@@ -344,72 +373,131 @@ enum_one() {
 
     # Optional POST probes
     if [[ "$PROBE" == "1" ]]; then
-        # OpenAI-compatible chat completion
         fetch_post "${url}/v1/chat/completions" \
-            "${d}/probe-v1-chat.body" \
-            "${d}/probe-v1-chat.head" \
+            "${d}/probe-v1-chat.body" "${d}/probe-v1-chat.head" \
             "{\"model\":\"${PROBE_MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":1}"
-
-        # OpenAI-compatible legacy completion
         fetch_post "${url}/v1/completions" \
-            "${d}/probe-v1-completions.body" \
-            "${d}/probe-v1-completions.head" \
+            "${d}/probe-v1-completions.body" "${d}/probe-v1-completions.head" \
             "{\"model\":\"${PROBE_MODEL}\",\"prompt\":\"hi\",\"max_tokens\":1}"
-
-        # Anthropic-style messages
         fetch_post "${url}/v1/messages" \
-            "${d}/probe-v1-messages.body" \
-            "${d}/probe-v1-messages.head" \
+            "${d}/probe-v1-messages.body" "${d}/probe-v1-messages.head" \
             "{\"model\":\"${PROBE_MODEL}\",\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"
-
-        # Ollama generate
         fetch_post "${url}/api/generate" \
-            "${d}/probe-ollama-generate.body" \
-            "${d}/probe-ollama-generate.head" \
+            "${d}/probe-ollama-generate.body" "${d}/probe-ollama-generate.head" \
             "{\"model\":\"${PROBE_MODEL}\",\"prompt\":\"hi\",\"stream\":false}"
     fi
 
-    # Fingerprint
-    local verdict
+    local verdict models
     verdict="$(fingerprint "$d")"
-    {
-        echo "URL:        $url"
-        echo "Verdict:    $verdict"
-        echo "Models:"
-        extract_models "$d" | sed 's/^/  - /' || true
-        echo
-        echo "GET status by endpoint:"
-        for f in "${d}"/*.head; do
-            [[ -f "$f" ]] || continue
-            local label st
-            label="$(basename "$f" .head)"
-            st="$(status_of "$f")"
-            printf "  %-30s %s\n" "$label" "${st:-???}"
-        done
-    } > "${d}/_fingerprint.txt"
+    models="$(extract_models "$d" | paste -sd ', ' -)"
 
-    # Append to top-level summary
+    # ---- emit this target's report section ----
     {
-        echo "## $url"
-        echo "verdict: $verdict"
-        local models
-        models="$(extract_models "$d" | paste -sd ', ' -)"
-        [[ -n "$models" ]] && echo "models: $models"
+        echo "================================================================================"
+        echo "[${idx}/${total}] ${url}"
+        echo "================================================================================"
+        printf "Verdict : %s\n" "$verdict"
+        if [[ -n "$models" ]]; then
+            printf "Models  : %s\n" "$models"
+        fi
         echo
-    } >> "$SUMMARY"
+        echo "Endpoint status:"
+        printf "  %-7s %-9s %s\n" "STATUS" "SIZE" "ENDPOINT"
+
+        # Status table, in the order I defined GET_ENDPOINTS
+        local label path st size ct
+        while IFS='|' read -r label path; do
+            [[ -z "$label" ]] && continue
+            read -r st size ct < <(meta_of "${d}/${label}.head" 2>/dev/null || echo "000 0 -")
+            printf "  %-7s %-9s %s\n" "$st" "$size" "$path"
+        done <<< "$GET_ENDPOINTS"
+
+        # POST probe rows (only if PROBE=1)
+        if [[ "$PROBE" == "1" ]]; then
+            for label in probe-v1-chat probe-v1-completions probe-v1-messages probe-ollama-generate; do
+                local head="${d}/${label}.head"
+                [[ -f "$head" ]] || continue
+                read -r st size ct < <(meta_of "$head")
+                local path
+                case "$label" in
+                    probe-v1-chat)             path="POST /v1/chat/completions" ;;
+                    probe-v1-completions)      path="POST /v1/completions" ;;
+                    probe-v1-messages)         path="POST /v1/messages" ;;
+                    probe-ollama-generate)     path="POST /api/generate" ;;
+                esac
+                printf "  %-7s %-9s %s\n" "$st" "$size" "$path"
+            done
+        fi
+
+        # Body excerpts (skip 000 / 404 / disabled)
+        if [[ "$BODY_EXCERPTS" == "1" ]]; then
+            echo
+            echo "Responses (excerpts, non-404 only):"
+            while IFS='|' read -r label path; do
+                [[ -z "$label" ]] && continue
+                read -r st size ct < <(meta_of "${d}/${label}.head" 2>/dev/null || echo "000 0 -")
+                [[ "$st" == "000" || "$st" == "404" ]] && continue
+                echo
+                printf -- "--- %s  [%s, %s bytes, %s] ---\n" "$path" "$st" "$size" "$ct"
+                body_excerpt "${d}/${label}.body" "$ct"
+            done <<< "$GET_ENDPOINTS"
+
+            if [[ "$PROBE" == "1" ]]; then
+                for label in probe-v1-chat probe-v1-completions probe-v1-messages probe-ollama-generate; do
+                    local body="${d}/${label}.body" head="${d}/${label}.head"
+                    [[ -f "$head" ]] || continue
+                    read -r st size ct < <(meta_of "$head")
+                    [[ "$st" == "000" || "$st" == "404" ]] && continue
+                    local path
+                    case "$label" in
+                        probe-v1-chat)         path="POST /v1/chat/completions" ;;
+                        probe-v1-completions)  path="POST /v1/completions" ;;
+                        probe-v1-messages)     path="POST /v1/messages" ;;
+                        probe-ollama-generate) path="POST /api/generate" ;;
+                    esac
+                    echo
+                    printf -- "--- %s  [%s, %s bytes, %s] ---\n" "$path" "$st" "$size" "$ct"
+                    body_excerpt "$body" "$ct"
+                done
+            fi
+        fi
+
+        echo
+    } >> "$REPORT"
 
     echo "    -> $verdict"
 }
 
+# ---- run --------------------------------------------------------------------
+
+# Header
+{
+    echo "################################################################################"
+    echo "# enum-ai.sh report"
+    echo "# Run     : ${TS}"
+    echo "# Targets : ${#BASE_URLS[@]}"
+    echo "# PROBE   : ${PROBE}"
+    echo "################################################################################"
+    echo
+} > "$REPORT"
+
+i=0
 for url in "${BASE_URLS[@]}"; do
-    enum_one "$url"
+    i=$((i + 1))
+    enum_one "$url" "$i" "${#BASE_URLS[@]}"
 done
 
+# Footer — verdicts-only index
+{
+    echo "================================================================================"
+    echo "Verdict index (quick scan)"
+    echo "================================================================================"
+    grep -E '^\[[0-9]+/[0-9]+\] |^Verdict : ' "$REPORT" | paste -d ' ' - -
+} >> "$REPORT"
+
 echo
-echo "[+] done. results in $OUT_DIR"
-echo "    summary: $SUMMARY"
+echo "[+] done. single report: $REPORT"
 echo
-echo "    quick triage:"
-echo "      cat $SUMMARY"
-echo "      rg -l 'gpt-|llama|claude|mistral|qwen' $OUT_DIR"
-echo "      rg -i '\"object\":\"list\"|FastAPI|gradio|streamlit' $OUT_DIR"
+echo "    eyeballing:"
+echo "      less $REPORT"
+echo "      grep -E '^(\\[[0-9]+/|Verdict|Models)' $REPORT"
