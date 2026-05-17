@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(chmod +x favourites/http-triage.sh)",
+      "Bash(bash -n favourites/http-triage.sh)",
+      "Bash(chmod +x favourites/enum-ai.sh)",
+      "Bash(bash -n favourites/enum-ai.sh)",
+      "Bash(chmod +x favourites/gobust.sh)",
+      "Bash(bash -n favourites/gobust.sh)",
+      "Bash(bash c:/Users/dlewi/Documents/GitHub/osai300/favourites/gobust.sh)"
+    ]
+  }
+}

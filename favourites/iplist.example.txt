@@ -1,0 +1,19 @@
+# Example iplist for http-triage.sh.
+#
+# Usage: copy this file to wherever I'm running the script from, named
+# iplist.txt, then run `./http-triage.sh` with no args:
+#
+#     cp .../favourites/iplist.example.txt ./iplist.txt
+#     # edit ./iplist.txt with my real targets
+#     ./http-triage.sh
+#
+# One target per line. Lines starting with # and blank lines are ignored.
+# Accepts IPs, hostnames, or CIDRs (nmap expands CIDRs itself).
+#
+# Any file named iplist.txt is gitignored anywhere in this repo — real
+# exam targets stay local.
+#
+# Examples (uncomment to use):
+# 10.10.10.42
+# 10.10.10.0/24
+# api.lab.local
